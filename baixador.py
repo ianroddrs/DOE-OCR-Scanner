@@ -7,6 +7,7 @@ ANO_INICIO = 1980
 ANO_FIM = 2007
 BASE_URL = "https://www.ioepa.com.br/arquivos/"
 PASTA_DESTINO = "pdfs_originais"
+PASTA_DESTINO_OCR = "textos_ocr"
 
 def iniciar_download():
     # Cria a pasta se não existir
@@ -44,9 +45,10 @@ def iniciar_download():
         for href in pdfs_para_baixar:
             nome_arquivo = href.split('/')[-1]
             caminho_local = os.path.join(PASTA_DESTINO, nome_arquivo)
+            caminho_ocr = os.path.join(PASTA_DESTINO_OCR, nome_arquivo.replace('.pdf', '_ocr.txt'))
             
             # Pula o arquivo se ele já existir (ótimo para continuar downloads interrompidos)
-            if os.path.exists(caminho_local):
+            if os.path.exists(caminho_local) or os.path.exists(caminho_ocr):
                 print(f"    -> [PULANDO] {nome_arquivo} já existe.")
                 continue
 
