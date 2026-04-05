@@ -1,1 +1,4 @@
+.busca_cache.pkl
+__pycache__/
+*.pyc
 temp_pdfs/
