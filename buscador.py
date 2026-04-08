@@ -99,4 +99,17 @@ def realizar_busca(nome, ano=None, mes=None, dia=None, cpf=None):
     return todos_resultados
 
 if __name__ == "__main__":
+<<<<<<< HEAD
     realizar_busca("antonio da silva gomes")
+=======
+    # EXEMPLOS DE USO:
+    
+    # 1. Busca específica
+    # realizar_busca(nome="IAN MATEUS ALVES RODRIGUES", ano=2025, mes=5)
+
+    # 2. Busca apenas por nome em todos os anos (Demorado se houver muitos PDFs)
+    # realizar_busca(nome="NOME DO ALVO")
+
+    # 3. Busca por nome e dia específico, independente do mês ou ano
+    realizar_busca("maria da conceição marques pinto")
+>>>>>>> 70fa0bc3e5fdd32a8645d8fb783a4c9df27d3c8d
