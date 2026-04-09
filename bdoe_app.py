@@ -100,16 +100,21 @@ class IndiceSQLite:
             conn.close()
 
     def obter_datas_baixadas(self):
-        conn = self.conectar()
-        cursor = conn.cursor()
-        cursor.execute("SELECT arquivo FROM controle_downloads")
-        arquivos = set(row[0] for row in cursor.fetchall())
-        conn.close()
-        return arquivos
+        conn = None
+        try:
+            conn = self.conectar()
+            cursor = conn.cursor()
+            cursor.execute("SELECT arquivo FROM controle_downloads")
+            arquivos = set(row[0] for row in cursor.fetchall())
+            return arquivos
+        finally:
+            if conn:
+                conn.close()
 
     def salvar_paginas_db(self, paginas_extraidas, arquivo, data_str):
         with self.db_lock:
             for tentativa in range(3):
+                conn = None
                 try:
                     conn = self.conectar()
                     cursor = conn.cursor()
@@ -138,14 +143,15 @@ class IndiceSQLite:
                 except Exception as e:
                     print(f"Erro geral DB em {arquivo}: {e}")
                     break
+                finally:
+                    if conn:
+                        conn.close()
 
     def buscar(self, nome, cpf=None, ano=None, mes=None, dia=None):
         nome_norm = normalizar_texto(nome)
         cpf_norm = re.sub(r'\D', '', cpf) if cpf else None
         if not nome_norm: return []
 
-        conn = self.conectar()
-        cursor = conn.cursor()
         query_match = f'"{nome_norm}"'
         if cpf_norm: query_match += f' AND "{cpf_norm}"'
 
@@ -156,19 +162,25 @@ class IndiceSQLite:
         if mes: sql += " AND mes = ?"; params.append(int(mes))
         if dia: sql += " AND dia = ?"; params.append(int(dia))
 
+        conn = None
+        linhas = []
         try:
+            conn = self.conectar()
+            cursor = conn.cursor()
             cursor.execute(sql, params)
             linhas = cursor.fetchall()
-        except:
+        except Exception as e:
+            print(f"Erro na busca: {e}")
             linhas = []
-        conn.close()
+        finally:
+            if conn:
+                conn.close()
 
         resultados = [{'arquivo': l[0], 'data': l[1], 'ano': l[2], 'pagina': l[3]} for l in linhas]
         try:
             resultados.sort(key=lambda x: datetime.strptime(x['data'], '%d/%m/%Y'), reverse=True)
         except: pass
         return resultados
-
 class AtualizadorDOE:
     def __init__(self, db, callback_status=None, callback_progresso=None):
         self.db = db
@@ -258,7 +270,7 @@ class AtualizadorDOE:
         if self.callback_status: self.callback_status(f"Processando {total} diários...", "#F59E0B", True, 'determinate')
         
         concluidos = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futuros = {executor.submit(self.processar_pdf_download, link): link for link in links}
             for futuro in concurrent.futures.as_completed(futuros):
                 concluidos += 1
