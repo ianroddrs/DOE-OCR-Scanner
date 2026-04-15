@@ -13,11 +13,20 @@ import fitz
 from pdf2image import convert_from_path
 import pytesseract
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 import time
 from threading import Thread
 import sys
+import logging
 
+# ========== SETUP DE LOGGING ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configuração de caminhos baseada no ambiente (PyInstaller ou Script normal)
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
@@ -27,6 +36,13 @@ CAMINHO_POPPLER = os.path.join(BASE_DIR, 'poppler', 'Library', 'bin')
 BASE_URL_IOEPA = "https://www.ioepa.com.br/arquivos/"
 DB_FILE = os.path.join(BASE_DIR, "indice_doe.db")
 
+# Configuração proativa do Tesseract
+CAMINHO_TESSERACT = os.path.join(BASE_DIR, 'tesseract', 'tesseract.exe')
+if os.path.exists(CAMINHO_TESSERACT):
+    pytesseract.pytesseract.tesseract_cmd = CAMINHO_TESSERACT
+
+# ========== FUNÇÕES DE VALIDAÇÃO E NORMALIZAÇÃO ==========
+
 def normalizar_texto(texto):
     if not texto: return ""
     texto = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('utf-8')
@@ -34,16 +50,91 @@ def normalizar_texto(texto):
     texto = re.sub(r'[^a-z0-9\s]', '', texto)
     return re.sub(r'\s+', ' ', texto).strip()
 
-def extrair_data_nome(nome_arquivo):
+def validar_data(ano, mes, dia):
+    """Valida se ano/mes/dia formam uma data real."""
     try:
-        base = nome_arquivo.upper().replace('.DOE.PDF', '').replace('.PDF', '')
-        partes = base.split('.')
-        if len(partes) >= 3:
-            ano, mes, dia = partes[0], partes[1], partes[2]
-            return f"{dia}/{mes}/{ano}", int(ano), int(mes), int(dia)
-    except:
-        pass
-    return None, None, None, None
+        if not all(isinstance(x, int) for x in [ano, mes, dia]):
+            return False
+        if ano < 1900 or ano > 2100:
+            return False
+        if mes < 1 or mes > 12:
+            return False
+        if dia < 1 or dia > 31:
+            return False
+        
+        datetime(ano, mes, dia) # O datetime levanta ValueError se não existir (ex: 31/02)
+        return True
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Data inválida: {ano}-{mes}-{dia} | Erro: {e}")
+        return False
+
+def extrair_data_nome(nome_arquivo):
+    """Extrai data usando Regex com validação robusta para evitar anomalias."""
+    try:
+        if not nome_arquivo or not isinstance(nome_arquivo, str):
+            return None, None, None, None
+
+        # Tenta padrão Internacional ou ISO: YYYY.MM.DD, YYYY-MM-DD, YYYY_MM_DD
+        match = re.search(r'(\d{4})[._-](\d{2})[._-](\d{2})', nome_arquivo)
+        if match:
+            ano, mes, dia = map(int, match.groups())
+        else:
+            # Fallback: Tenta padrão Brasileiro: DD.MM.YYYY, DD-MM-YYYY, DD_MM_YYYY
+            match_br = re.search(r'(\d{2})[._-](\d{2})[._-](\d{4})', nome_arquivo)
+            if match_br:
+                dia, mes, ano = map(int, match_br.groups())
+            else:
+                return None, None, None, None
+
+        if not validar_data(ano, mes, dia):
+            logger.warning(f"Data inválida extraída de {nome_arquivo}: {ano}-{mes}-{dia}")
+            return None, None, None, None
+
+        data_str = f"{dia:02d}/{mes:02d}/{ano}"
+        return data_str, ano, mes, dia
+    except Exception as e:
+        logger.error(f"Erro inesperado em extrair_data_nome({nome_arquivo}): {e}")
+        return None, None, None, None
+
+def validar_entrada_busca(nome, cpf=None, ano=None, mes=None, dia=None):
+    """Valida entrada do usuário para a interface de busca."""
+    if not nome or not isinstance(nome, str):
+        return False, "O Nome é obrigatório."
+    
+    nome_limpo = nome.strip()
+    if len(nome_limpo) < 3:
+        return False, "O Nome deve ter pelo menos 3 caracteres."
+    
+    if not any(c.isalpha() for c in nome_limpo):
+        return False, "O Nome deve conter pelo menos uma letra."
+    
+    if cpf and cpf.strip():
+        cpf_nums = re.sub(r'\D', '', cpf)
+        if len(cpf_nums) != 11:
+            return False, "O CPF deve ter 11 dígitos."
+    
+    if any([ano, mes, dia]):
+        try:
+            ano_int = int(ano) if ano else None
+            mes_int = int(mes) if mes else None
+            dia_int = int(dia) if dia else None
+            
+            if ano_int and (ano_int < 1990 or ano_int > datetime.now().year):
+                return False, f"Ano deve estar entre 1990 e {datetime.now().year}."
+            if mes_int and not (1 <= mes_int <= 12):
+                return False, "Mês deve estar entre 1 e 12."
+            if dia_int and not (1 <= dia_int <= 31):
+                return False, "Dia deve estar entre 1 e 31."
+            
+            if ano_int and mes_int and dia_int:
+                if not validar_data(ano_int, mes_int, dia_int):
+                    return False, "Data de busca inválida ou inexistente."
+        except ValueError as e:
+            return False, f"Erro na data (Use apenas números): {e}"
+    
+    return True, ""
+
+# ========== CLASSES PRINCIPAIS ==========
 
 class IndiceSQLite:
     def __init__(self, db_path=DB_FILE):
@@ -56,48 +147,54 @@ class IndiceSQLite:
 
     def _inicializar_tabelas(self):
         with self.db_lock:
-            conn = self.conectar()
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cursor = conn.cursor()
-            
-            cursor.execute("PRAGMA table_info(controle_downloads)")
-            colunas = cursor.fetchall()
-            
-            precisa_migrar = False
-            if colunas:
-                primeira_coluna = colunas[0][1]
-                if primeira_coluna == "data_publicacao":
+            conn = None
+            try:
+                conn = self.conectar()
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cursor = conn.cursor()
+                
+                cursor.execute("PRAGMA table_info(controle_downloads)")
+                colunas = cursor.fetchall()
+                
+                precisa_migrar = False
+                if colunas and colunas[0][1] == "data_publicacao":
                     precisa_migrar = True
-            
-            if precisa_migrar:
+                
+                if precisa_migrar:
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS controle_downloads_novo (
+                            arquivo TEXT PRIMARY KEY,
+                            data_publicacao DATE
+                        )
+                    ''')
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO controle_downloads_novo 
+                        SELECT arquivo, data_publicacao FROM controle_downloads
+                    ''')
+                    cursor.execute('DROP TABLE controle_downloads')
+                    cursor.execute('ALTER TABLE controle_downloads_novo RENAME TO controle_downloads')
+                else:
+                    cursor.execute('''
+                        CREATE TABLE IF NOT EXISTS controle_downloads (
+                            arquivo TEXT PRIMARY KEY,
+                            data_publicacao DATE
+                        )
+                    ''')
+                
                 cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS controle_downloads_novo (
-                        arquivo TEXT PRIMARY KEY,
-                        data_publicacao DATE
+                    CREATE VIRTUAL TABLE IF NOT EXISTS diarios USING fts5(
+                        arquivo, data, ano UNINDEXED, mes UNINDEXED, dia UNINDEXED, pagina UNINDEXED, texto,
+                        tokenize='unicode61 remove_diacritics 1'
                     )
                 ''')
-                cursor.execute('''
-                    INSERT OR IGNORE INTO controle_downloads_novo (arquivo, data_publicacao)
-                    SELECT arquivo, data_publicacao FROM controle_downloads
-                ''')
-                cursor.execute('DROP TABLE controle_downloads')
-                cursor.execute('ALTER TABLE controle_downloads_novo RENAME TO controle_downloads')
-            else:
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS controle_downloads (
-                        arquivo TEXT PRIMARY KEY,
-                        data_publicacao DATE
-                    )
-                ''')
-            
-            cursor.execute('''
-                CREATE VIRTUAL TABLE IF NOT EXISTS diarios USING fts5(
-                    arquivo, data, ano UNINDEXED, mes UNINDEXED, dia UNINDEXED, pagina UNINDEXED, texto,
-                    tokenize='unicode61 remove_diacritics 1'
-                )
-            ''')
-            conn.commit()
-            conn.close()
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Erro ao inicializar tabelas: {e}")
+                if conn: conn.rollback()
+            finally:
+                if conn:
+                    try: conn.close()
+                    except Exception as e: logger.warning(f"Erro ao fechar conexão no Init: {e}")
 
     def obter_datas_baixadas(self):
         conn = None
@@ -105,13 +202,24 @@ class IndiceSQLite:
             conn = self.conectar()
             cursor = conn.cursor()
             cursor.execute("SELECT arquivo FROM controle_downloads")
-            arquivos = set(row[0] for row in cursor.fetchall())
-            return arquivos
+            return set(row[0] for row in cursor.fetchall())
+        except Exception as e:
+            logger.error(f"Erro ao listar baixados: {e}")
+            return set()
         finally:
-            if conn:
-                conn.close()
+            if conn: conn.close()
 
     def salvar_paginas_db(self, paginas_extraidas, arquivo, data_str):
+        if not paginas_extraidas:
+            logger.info(f"Nenhuma página a salvar para o arquivo {arquivo}.")
+            return True
+        
+        try:
+            datetime.strptime(data_str, "%d/%m/%Y")
+        except ValueError:
+            logger.error(f"Data inválida barrada antes de salvar: {data_str}")
+            return False
+
         with self.db_lock:
             for tentativa in range(3):
                 conn = None
@@ -119,37 +227,40 @@ class IndiceSQLite:
                     conn = self.conectar()
                     cursor = conn.cursor()
                     
-                    if paginas_extraidas:
-                        for pag in paginas_extraidas:
-                            cursor.execute('''
-                                INSERT INTO diarios (arquivo, data, ano, mes, dia, pagina, texto)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            ''', (pag['arquivo'], pag['data'], pag['ano'], pag['mes'], pag['dia'], pag['pagina'], pag['texto']))
+                    for pag in paginas_extraidas:
+                        cursor.execute('''
+                            INSERT INTO diarios (arquivo, data, ano, mes, dia, pagina, texto)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (pag['arquivo'], pag['data'], pag['ano'], pag['mes'], pag['dia'], pag['pagina'], pag['texto']))
                     
-                    if data_str:
-                        data_db = datetime.strptime(data_str, "%d/%m/%Y").strftime("%Y-%m-%d")
-                        cursor.execute("INSERT OR IGNORE INTO controle_downloads (arquivo, data_publicacao) VALUES (?, ?)", (arquivo, data_db))
+                    data_db = datetime.strptime(data_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+                    cursor.execute("INSERT OR IGNORE INTO controle_downloads (arquivo, data_publicacao) VALUES (?, ?)", (arquivo, data_db))
                     
                     conn.commit()
-                    conn.close()
-                    break
-                    
+                    logger.info(f"Salvo {len(paginas_extraidas)} páginas do {arquivo}")
+                    return True
                 except sqlite3.OperationalError as e:
                     if "locked" in str(e).lower():
-                        time.sleep(1)
+                        logger.warning(f"DB Locked na tentativa {tentativa+1}. Aguardando...")
+                        time.sleep(2 ** tentativa)
                     else:
-                        print(f"Erro DB ao salvar {arquivo}: {e}")
-                        break
+                        logger.error(f"Erro DB salvar {arquivo}: {e}")
+                        return False
                 except Exception as e:
-                    print(f"Erro geral DB em {arquivo}: {e}")
-                    break
+                    logger.error(f"Erro geral DB em {arquivo}: {e}")
+                    return False
                 finally:
                     if conn:
-                        conn.close()
+                        try: conn.close()
+                        except: pass
+        
+        logger.error(f"Falha ao salvar {arquivo} após 3 tentativas (Lock)")
+        return False
 
     def buscar(self, nome, cpf=None, ano=None, mes=None, dia=None):
         nome_norm = normalizar_texto(nome)
         cpf_norm = re.sub(r'\D', '', cpf) if cpf else None
+        
         if not nome_norm: return []
 
         query_match = f'"{nome_norm}"'
@@ -158,9 +269,18 @@ class IndiceSQLite:
         sql = "SELECT arquivo, data, ano, pagina FROM diarios WHERE diarios MATCH ?"
         params = [query_match]
 
-        if ano: sql += " AND ano = ?"; params.append(int(ano))
-        if mes: sql += " AND mes = ?"; params.append(int(mes))
-        if dia: sql += " AND dia = ?"; params.append(int(dia))
+        try:
+            if ano and str(ano).strip(): 
+                sql += " AND ano = ?"; params.append(int(ano))
+            if mes and str(mes).strip(): 
+                sql += " AND mes = ?"; params.append(int(mes))
+            if dia and str(dia).strip(): 
+                sql += " AND dia = ?"; params.append(int(dia))
+        except ValueError:
+            logger.error("Falha silenciosa prevenida: Tentativa de busca com data não-numérica no BD.")
+            return []
+
+        sql += " LIMIT 300"
 
         conn = None
         linhas = []
@@ -170,43 +290,47 @@ class IndiceSQLite:
             cursor.execute(sql, params)
             linhas = cursor.fetchall()
         except Exception as e:
-            print(f"Erro na busca: {e}")
-            linhas = []
+            logger.error(f"Erro executando query: {e}")
         finally:
-            if conn:
-                conn.close()
+            if conn: conn.close()
 
         resultados = [{'arquivo': l[0], 'data': l[1], 'ano': l[2], 'pagina': l[3]} for l in linhas]
         try:
             resultados.sort(key=lambda x: datetime.strptime(x['data'], '%d/%m/%Y'), reverse=True)
-        except: pass
+        except Exception as e:
+            logger.warning(f"Erro ordenando datas: {e}")
         return resultados
+
 class AtualizadorDOE:
     def __init__(self, db, callback_status=None, callback_progresso=None):
         self.db = db
         self.callback_status = callback_status
         self.callback_progresso = callback_progresso
-        self.arquivos_ja_baixados = self.db.obter_datas_baixadas()
+        self.MAX_PDF_SIZE = 100 * 1024 * 1024  # Proteção OOM: 100 MB max
 
     def buscar_links_disponiveis(self):
-        self.arquivos_ja_baixados = self.db.obter_datas_baixadas()
+        arquivos_ja_baixados = self.db.obter_datas_baixadas()
         links_para_baixar = []
-        ano_atual = datetime.now().year
         
-        try:
-            url_ano = f"{BASE_URL_IOEPA}{ano_atual}/"
-            resposta = requests.get(url_ano, timeout=10)
-            soup = BeautifulSoup(resposta.text, 'html.parser')
-            
-            for a_tag in soup.find_all('a'):
-                href = a_tag.get('href')
-                if href and href.lower().endswith('.pdf'):
-                    nome_arquivo = href.split('/')[-1]
-                    if nome_arquivo not in self.arquivos_ja_baixados:
-                        url_completa = href if href.startswith('http') else f"{url_ano}{nome_arquivo}"
-                        links_para_baixar.append({'url': url_completa, 'arquivo': nome_arquivo})
-        except Exception as e:
-            if self.callback_status: self.callback_status(f"Erro rede: {e}", "#EF4444")
+        ano_atual = datetime.now().year
+        anos_verificacao = [ano_atual, ano_atual - 1]
+        
+        for ano in anos_verificacao:
+            try:
+                url_ano = f"{BASE_URL_IOEPA}{ano}/"
+                resposta = requests.get(url_ano, timeout=30)
+                if resposta.status_code != 200: continue
+                    
+                soup = BeautifulSoup(resposta.text, 'html.parser')
+                for a_tag in soup.find_all('a'):
+                    href = a_tag.get('href')
+                    if href and href.lower().endswith('.pdf'):
+                        nome_arquivo = href.split('/')[-1]
+                        if nome_arquivo not in arquivos_ja_baixados:
+                            url_completa = href if href.startswith('http') else f"{url_ano}{nome_arquivo}"
+                            links_para_baixar.append({'url': url_completa, 'arquivo': nome_arquivo})
+            except Exception as e:
+                logger.error(f"Erro repo ano {ano}: {e}")
             
         return links_para_baixar
 
@@ -221,36 +345,50 @@ class AtualizadorDOE:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
             temp_pdf_path = temp_pdf.name
             try:
-                resposta = requests.get(url, stream=True, timeout=30)
+                resposta = requests.get(url, stream=True, timeout=60)
                 resposta.raise_for_status()
+                
+                tamanho_atual = 0
                 for chunk in resposta.iter_content(chunk_size=8192):
+                    tamanho_atual += len(chunk)
+                    if tamanho_atual > self.MAX_PDF_SIZE:
+                        logger.error(f"Arquivo {arquivo} excede 100MB. Ignorado.")
+                        return False
                     temp_pdf.write(chunk)
                 temp_pdf.flush()
                 
-                if ano >= 2008:
-                    doc = fitz.open(temp_pdf_path)
-                    for num_pagina, pagina in enumerate(doc, start=1):
-                        texto = normalizar_texto(pagina.get_text())
-                        if texto:
-                            paginas_extraidas.append({
-                                'arquivo': arquivo, 'data': data_str, 'ano': ano, 
-                                'mes': mes, 'dia': dia, 'pagina': num_pagina, 'texto': texto
-                            })
-                    doc.close()
-                else:
-                    paginas = convert_from_path(temp_pdf_path, dpi=150, poppler_path=CAMINHO_POPPLER, grayscale=True)
-                    for num_pagina, img in enumerate(paginas, start=1):
-                        texto = normalizar_texto(pytesseract.image_to_string(img, lang='por'))
-                        if texto:
-                            paginas_extraidas.append({
-                                'arquivo': arquivo, 'data': data_str, 'ano': ano, 
-                                'mes': mes, 'dia': dia, 'pagina': num_pagina, 'texto': texto
-                            })
-                            
-                self.db.salvar_paginas_db(paginas_extraidas, arquivo, data_str)
-                return True
-            except Exception as e:
-                print(f"Erro arquivo {arquivo}: {e}")
+                try:
+                    if ano >= 2008:
+                        doc = fitz.open(temp_pdf_path)
+                        for num_pagina, pagina in enumerate(doc, start=1):
+                            texto = normalizar_texto(pagina.get_text())
+                            if texto:
+                                paginas_extraidas.append({
+                                    'arquivo': arquivo, 'data': data_str, 'ano': ano, 
+                                    'mes': mes, 'dia': dia, 'pagina': num_pagina, 'texto': texto
+                                })
+                        doc.close()
+                    else:
+                        paginas = convert_from_path(temp_pdf_path, dpi=150, poppler_path=CAMINHO_POPPLER, grayscale=True)
+                        for num_pagina, img in enumerate(paginas, start=1):
+                            texto = normalizar_texto(pytesseract.image_to_string(img, lang='por'))
+                            if texto:
+                                paginas_extraidas.append({
+                                    'arquivo': arquivo, 'data': data_str, 'ano': ano, 
+                                    'mes': mes, 'dia': dia, 'pagina': num_pagina, 'texto': texto
+                                })
+                                
+                    if not paginas_extraidas:
+                        logger.warning(f"Arquivo {arquivo} processado mas sem texto (talvez imagem corrompida).")
+                        return False
+                        
+                    return self.db.salvar_paginas_db(paginas_extraidas, arquivo, data_str)
+                    
+                except Exception as e:
+                    logger.error(f"Erro corrupção/conversão PDF {arquivo}: {e}")
+                    return False
+            except requests.RequestException as e:
+                logger.error(f"Erro de rede baixando {arquivo}: {e}")
                 return False
             finally:
                 temp_pdf.close()
@@ -270,13 +408,12 @@ class AtualizadorDOE:
         if self.callback_status: self.callback_status(f"Processando {total} diários...", "#F59E0B", True, 'determinate')
         
         concluidos = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             futuros = {executor.submit(self.processar_pdf_download, link): link for link in links}
             for futuro in concurrent.futures.as_completed(futuros):
                 concluidos += 1
                 if self.callback_progresso: self.callback_progresso(concluidos, total)
 
-        # Otimiza o banco garantindo que usa a trava para não colidir
         try:
             with self.db.db_lock:
                 conn = self.db.conectar()
@@ -284,7 +421,7 @@ class AtualizadorDOE:
                 conn.commit()
                 conn.close()
         except Exception as e:
-            print(f"Erro na otimização final: {e}")
+            logger.error(f"Erro Otimização Final DB: {e}")
 
         if self.callback_status: self.callback_status("Atualização concluída.", "#10B981", False)
 
@@ -431,9 +568,15 @@ class BDOEApp:
         atualizador = AtualizadorDOE(self.db, self.atualizar_status, self.progresso_atualizacao)
         
         def _thread():
-            atualizador.iniciar_atualizacao()
-            self.root.after(0, lambda: self.btn_atualizar.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.btn_buscar.config(state=tk.NORMAL))
+            try:
+                atualizador.iniciar_atualizacao()
+            except Exception as e:
+                logger.error(f"Thread atualização falhou fatalmente: {e}")
+                self.atualizar_status("Erro fatal na atualização.", EstiloUI.CORES['erro'])
+            finally:
+                self.root.after(0, lambda: self.btn_atualizar.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.btn_buscar.config(state=tk.NORMAL))
+                
         Thread(target=_thread, daemon=True).start()
 
     def limpar_campos(self):
@@ -446,7 +589,16 @@ class BDOEApp:
 
     def iniciar_busca(self):
         nome = self.entry_nome.get().strip()
-        if len(nome) < 2: return
+        cpf = self.entry_cpf.get().strip()
+        ano = self.entry_ano.get().strip()
+        mes = self.entry_mes.get().strip()
+        dia = self.entry_dia.get().strip()
+        
+        # Validando as entradas primeiro
+        valido, erro_msg = validar_entrada_busca(nome, cpf, ano, mes, dia)
+        if not valido:
+            messagebox.showwarning("Atenção - Busca Inválida", erro_msg)
+            return
 
         self.btn_buscar.config(state=tk.DISABLED)
         self.atualizar_status("Buscando...", EstiloUI.CORES['alerta'], True, 'indeterminate')
@@ -454,14 +606,15 @@ class BDOEApp:
         self.text_resultado.delete(1.0, tk.END)
         self.links_armazenados.clear()
         
-        Thread(target=self._executar, args=(nome,), daemon=True).start()
+        Thread(target=self._executar, args=(nome, cpf, ano, mes, dia), daemon=True).start()
 
-    def _executar(self, nome):
-        res = self.db.buscar(nome, self.entry_cpf.get(), self.entry_ano.get(), self.entry_mes.get(), self.entry_dia.get())
+    def _executar(self, nome, cpf, ano, mes, dia):
+        res = self.db.buscar(nome, cpf, ano, mes, dia)
 
         def _concluir():
             if not res:
-                self.text_resultado.insert(tk.END, "\n   Nenhum registro encontrado.")
+                self.text_resultado.insert(tk.END, "\n   Nenhum registro encontrado com estes parâmetros.")
+                aviso_limite = ""
             else:
                 for i, r in enumerate(res, 1):
                     self.text_resultado.insert(tk.END, f"   OCORRÊNCIA #{i:03d}\n")
@@ -480,22 +633,37 @@ class BDOEApp:
                     self.text_resultado.tag_add("link", idx_inicio, idx_fim)
                     self.text_resultado.tag_add(tag, idx_inicio, idx_fim)
                     self.text_resultado.insert(tk.END, "-" * 60 + "\n")
+                
+                aviso_limite = "+" if len(res) >= 300 else ""
+                if aviso_limite:
+                    self.text_resultado.insert(tk.END, "\n   [Aviso: Limite de 300 resultados atingido. Refine sua busca com filtros.]\n")
 
             self.text_resultado.config(state=tk.DISABLED)
-            self.lbl_contador.config(text=f"Resultados ({len(res)})")
+            self.lbl_contador.config(text=f"Resultados ({len(res)}{aviso_limite})")
             self.atualizar_status("Busca concluída.", EstiloUI.CORES['sucesso'])
             self.btn_buscar.config(state=tk.NORMAL)
+            
         self.root.after(0, _concluir)
 
     def abrir_link(self, event):
-        tags = self.text_resultado.tag_names(tk.CURRENT)
-        for tag in tags:
-            if tag.startswith("link_") and tag in self.links_armazenados:
-                webbrowser.open(self.links_armazenados[tag])
-                break
+        try:
+            tags = self.text_resultado.tag_names(tk.CURRENT)
+            if not tags: return
+            
+            for tag in tags:
+                if tag.startswith("link_") and tag in self.links_armazenados:
+                    url = self.links_armazenados[tag]
+                    try:
+                        webbrowser.open(url)
+                    except Exception as e:
+                        logger.error(f"Falha ao abrir navegador: {e}")
+                        messagebox.showerror("Erro", f"Não foi possível abrir o link: {e}")
+                    break
+        except Exception as e:
+            logger.error(f"Erro em abrir_link: {e}")
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    root = tk.Tk() 
     app = BDOEApp(root)
     root.eval('tk::PlaceWindow . center')
     root.mainloop()
